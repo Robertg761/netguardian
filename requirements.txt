@@ -1,0 +1,19 @@
+# NetGuardian - Network Analysis Suite Requirements
+# Install with: pip install -r requirements.txt
+
+# Core packet manipulation library
+scapy>=2.4.5
+
+# Python interface to nmap
+python-nmap>=0.7.1
+
+# Standard library modules (no installation needed):
+# - argparse (for command-line interface)
+# - logging (for logging functionality)  
+# - ipaddress (for IP address validation)
+# - socket (for network operations)
+# - subprocess (for running external commands)
+# - threading (for concurrent operations)
+# - time (for timing operations)
+# - typing (for type hints)
+# - sys, os, re (standard utilities)
