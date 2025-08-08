@@ -10,6 +10,12 @@ python-nmap>=0.7.1
 # GUI framework (for graphical interface)
 PyQt6>=6.5
 
+# Service discovery and network enumeration
+zeroconf>=0.47.1
+bleak>=0.19.5
+psutil>=5.9.0
+python-nmap>=0.7.1
+
 # Standard library modules (no installation needed):
 # - argparse (for command-line interface)
 # - logging (for logging functionality)  

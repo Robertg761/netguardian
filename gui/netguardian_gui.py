@@ -29,20 +29,94 @@ from PyQt6.QtGui import (
     QPainter, QBrush, QPen
 )
 
-# Add the NetGuardian path to import the modules (resolve dynamically)
-PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+# Add NetGuardian project paths so bundled app can import local modules
+try:
+    if getattr(sys, 'frozen', False):
+        # When frozen, rely on PyInstaller's importer for embedded modules.
+        # Do NOT modify sys.path to avoid shadowing embedded modules with data files.
+        pass
+    else:
+        PROJECT_ROOT = Path(__file__).resolve().parents[1]
+        for p in (PROJECT_ROOT, PROJECT_ROOT / 'gui'):
+            p_str = str(p)
+            if p_str not in sys.path:
+                sys.path.insert(0, p_str)
+except Exception:
+    pass
 
 try:
+    # Import project modules normally (PyInstaller hiddenimports embed them)
     from discovery import HostDiscoverer
     from scanner import PortScanner
     from sniffer import PacketSniffer
     from vuln_testing import VulnerabilityTester
     from advanced_testing import EthicalTester
 except ImportError as e:
-    print(f"Warning: Could not import NetGuardian modules: {e}")
-    print("GUI will run in demo mode.")
+    # Fallback: attempt dynamic loading of modules from bundled data under Resources/modules
+    try:
+        import importlib.util as _il
+        def _load_module(mod_name, filename_candidates):
+            for fp in filename_candidates:
+                try:
+                    p = Path(fp)
+                    # Debug: show each candidate
+                    # print(f"Trying {mod_name} from {p}")
+                    if p.exists() and p.is_file():
+                        # Read as text to guard against corrupted/binary files
+                        data = p.read_bytes()
+                        if b"\x00" in data:
+                            # print(f"Skipping {p} due to null bytes")
+                            continue
+                        spec = _il.spec_from_file_location(mod_name, str(p))
+                        if spec and spec.loader:
+                            m = _il.module_from_spec(spec)
+                            spec.loader.exec_module(m)
+                            sys.modules[mod_name] = m
+                            return m
+                except Exception:
+                    continue
+            raise ImportError(f"Could not dynamically load {mod_name}")
+        # Determine candidate roots
+        roots = []
+        if getattr(sys, 'frozen', False):
+            macos_dir = Path(sys.executable).resolve().parent              # Contents/MacOS
+            resources_dir = macos_dir.parent / 'Resources'                 # Contents/Resources
+            modules_dir = resources_dir / 'modules'
+            # Make modules importable via normal import as well
+            if str(modules_dir) not in sys.path:
+                sys.path.insert(0, str(modules_dir))
+            roots.extend([modules_dir, resources_dir])
+        else:
+            roots.append(Path(__file__).resolve().parents[1])
+        # Build candidate file lists
+        def cands(name):
+            files = []
+            for r in roots:
+                files.append(r / f"{name}.py")
+                files.append(r / 'gui' / f"{name}.py")
+            return files
+        # Try normal import again in case sys.path was updated
+        try:
+            from discovery import HostDiscoverer  # type: ignore
+            from scanner import PortScanner  # type: ignore
+            from sniffer import PacketSniffer  # type: ignore
+            from vuln_testing import VulnerabilityTester  # type: ignore
+            from advanced_testing import EthicalTester  # type: ignore
+        except Exception:
+            dmod = _load_module('discovery', cands('discovery'))
+            smod = _load_module('scanner', cands('scanner'))
+            snmod = _load_module('sniffer', cands('sniffer'))
+            vmod = _load_module('vuln_testing', cands('vuln_testing'))
+            amod = _load_module('advanced_testing', cands('advanced_testing'))
+            HostDiscoverer = getattr(dmod, 'HostDiscoverer')
+            PortScanner = getattr(smod, 'PortScanner', None) or getattr(smod, 'PortScanner')
+            PacketSniffer = getattr(snmod, 'PacketSniffer')
+            VulnerabilityTester = getattr(vmod, 'VulnerabilityTester', None)
+            EthicalTester = getattr(amod, 'EthicalTester', None)
+            print("NetGuardian modules loaded via dynamic fallback")
+    except Exception as e2:
+        print(f"Warning: Could not import NetGuardian modules: {e2}")
+        print("GUI will run in demo mode.")
 
 
 class ModernStyle:
@@ -305,6 +379,7 @@ class NetworkWorker(QThread):
     progress = pyqtSignal(str)  # status message
     error = pyqtSignal(str)  # error message
     packet = pyqtSignal(dict)  # per-packet signal for sniffing
+    discover_progress = pyqtSignal(int, int)  # current, total
     
     def __init__(self, operation_type: str, **kwargs):
         super().__init__()
@@ -331,11 +406,32 @@ class NetworkWorker(QThread):
         self.progress.emit("Initializing host discovery...")
         discoverer = HostDiscoverer()
         target = self.kwargs.get('target')
+        resolve = self.kwargs.get('resolve', False)
+        include_mdns = self.kwargs.get('include_mdns', True)
+        include_ssdp = self.kwargs.get('include_ssdp', True)
+        include_ipv6 = self.kwargs.get('include_ipv6', True)
+        include_ble = self.kwargs.get('include_ble', False)
+        include_wifi = self.kwargs.get('include_wifi', True)
         
         self.progress.emit(f"Scanning network: {target}")
-        results = discoverer.discover_hosts(target)
         
-        self.progress.emit(f"Discovery complete. Found {len(results)} hosts.")
+        def cb(cur, total):
+            self.discover_progress.emit(cur, total)
+        
+        results = discoverer.discover_extended(
+            target,
+            resolve_hostnames=resolve,
+            include_mdns=include_mdns,
+            include_ssdp=include_ssdp,
+            include_ipv6=include_ipv6,
+            include_ble=include_ble,
+            include_wifi=include_wifi,
+            progress_callback=cb,
+        )
+        
+        host_count = len(results.get('hosts', []))
+        extra_count = len(results.get('extras', []))
+        self.progress.emit(f"Discovery complete. Found {host_count} hosts and {extra_count} services/devices.")
         self.finished.emit('discover', results)
     
     def scan_ports(self):
@@ -395,6 +491,7 @@ class HostDiscoveryTab(QWidget):
         super().__init__()
         self.init_ui()
         self.worker = None
+        self.local_networks_cached = []
     
     def init_ui(self):
         layout = QVBoxLayout()
@@ -403,15 +500,55 @@ class HostDiscoveryTab(QWidget):
         config_group = QGroupBox("Discovery Configuration")
         config_layout = QFormLayout()
         
+        # Target network input with helper
+        target_row = QHBoxLayout()
         self.target_input = QLineEdit("192.168.1.0/24")
         self.target_input.setPlaceholderText("Enter target network (e.g., 192.168.1.0/24)")
-        config_layout.addRow("Target Network:", self.target_input)
+        self.local_nets_combo = QComboBox()
+        self.local_nets_combo.setMinimumWidth(220)
+        self.local_nets_combo.setEditable(False)
+        self.refresh_nets_btn = QPushButton("🔄 Local Networks")
+        self.refresh_nets_btn.setToolTip("List local networks detected on this system")
+        self.refresh_nets_btn.clicked.connect(self.load_local_networks)
         
+        target_row.addWidget(self.target_input, 3)
+        target_row.addWidget(self.local_nets_combo, 2)
+        target_row.addWidget(self.refresh_nets_btn, 1)
+        
+        config_layout.addRow("Target Network:", target_row)
+        
+        # Options
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(1, 30)
         self.timeout_spin.setValue(5)
         self.timeout_spin.setSuffix(" seconds")
         config_layout.addRow("Timeout:", self.timeout_spin)
+        
+        self.resolve_names_chk = QCheckBox("Resolve hostnames")
+        self.resolve_names_chk.setChecked(False)
+        
+        # Extended discovery toggles
+        self.ext_mdns_chk = QCheckBox("mDNS/Bonjour")
+        self.ext_mdns_chk.setChecked(True)
+        self.ext_ssdp_chk = QCheckBox("UPnP/SSDP")
+        self.ext_ssdp_chk.setChecked(True)
+        self.ext_ipv6_chk = QCheckBox("IPv6 neighbors")
+        self.ext_ipv6_chk.setChecked(True)
+        self.ext_ble_chk = QCheckBox("Bluetooth LE (requires permission)")
+        self.ext_ble_chk.setChecked(False)
+        self.ext_wifi_chk = QCheckBox("Nearby Wi‑Fi SSIDs")
+        self.ext_wifi_chk.setChecked(True)
+        
+        opts_layout = QVBoxLayout()
+        opts_layout.addWidget(self.resolve_names_chk)
+        opts_layout.addWidget(self.ext_mdns_chk)
+        opts_layout.addWidget(self.ext_ssdp_chk)
+        opts_layout.addWidget(self.ext_ipv6_chk)
+        opts_layout.addWidget(self.ext_wifi_chk)
+        opts_layout.addWidget(self.ext_ble_chk)
+        opts_container = QWidget()
+        opts_container.setLayout(opts_layout)
+        config_layout.addRow("Options:", opts_container)
         
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
@@ -446,20 +583,35 @@ class HostDiscoveryTab(QWidget):
         self.status_label = QLabel("Ready to discover hosts")
         layout.addWidget(self.status_label)
         
-        # Results table
-        results_group = QGroupBox("Discovered Hosts")
+        # Results tables
+        results_group = QGroupBox("Discovery Results")
         results_layout = QVBoxLayout()
         
+        # Hosts table
+        host_label = QLabel("Hosts (ARP)")
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(3)
-        self.results_table.setHorizontalHeaderLabels(["IP Address", "MAC Address", "Status"])
+        self.results_table.setColumnCount(4)
+        self.results_table.setHorizontalHeaderLabels(["IP Address", "MAC Address", "Hostname", "Status"])
         self.results_table.horizontalHeader().setStretchLastSection(True)
-        
+        results_layout.addWidget(host_label)
         results_layout.addWidget(self.results_table)
+
+        # Extras table (mDNS/SSDP/IPv6/Wi‑Fi/BLE)
+        extras_label = QLabel("Services & Nearby Devices (mDNS, SSDP, IPv6, Wi‑Fi, BLE)")
+        self.extras_table = QTableWidget()
+        self.extras_table.setColumnCount(5)
+        self.extras_table.setHorizontalHeaderLabels(["Type", "Name/SSID", "Address", "Port/RSSI", "Details"])
+        self.extras_table.horizontalHeader().setStretchLastSection(True)
+        results_layout.addWidget(extras_label)
+        results_layout.addWidget(self.extras_table)
+
         results_group.setLayout(results_layout)
         layout.addWidget(results_group)
         
         self.setLayout(layout)
+        
+        # Preload local networks
+        self.load_local_networks()
     
     def start_discovery(self):
         target = self.target_input.text().strip()
@@ -470,17 +622,46 @@ class HostDiscoveryTab(QWidget):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.results_table.setRowCount(0)
         self.export_button.setEnabled(False)
         
         # Start worker thread
-        self.worker = NetworkWorker('discover', target=target)
+        self.worker = NetworkWorker(
+            'discover',
+            target=target,
+            resolve=self.resolve_names_chk.isChecked(),
+            include_mdns=self.ext_mdns_chk.isChecked(),
+            include_ssdp=self.ext_ssdp_chk.isChecked(),
+            include_ipv6=self.ext_ipv6_chk.isChecked(),
+            include_ble=self.ext_ble_chk.isChecked(),
+            include_wifi=self.ext_wifi_chk.isChecked(),
+        )
         self.worker.progress.connect(self.update_status)
+        self.worker.discover_progress.connect(self.on_discover_progress)
         self.worker.finished.connect(self.discovery_finished)
         self.worker.error.connect(self.discovery_error)
         self.worker.start()
     
+    def load_local_networks(self):
+        try:
+            discoverer = HostDiscoverer()
+            nets = discoverer.get_local_networks()
+            self.local_networks_cached = nets
+            self.local_nets_combo.clear()
+            if nets:
+                self.local_nets_combo.addItems(nets)
+                # When selecting, update target input
+                self.local_nets_combo.currentTextChanged.connect(lambda text: self.target_input.setText(text))
+            else:
+                self.local_nets_combo.addItem("No local networks found")
+        except Exception as e:
+            self.local_nets_combo.clear()
+            self.local_nets_combo.addItem("Error listing networks")
+            # Surface error in status for troubleshooting
+            self.status_label.setText(f"Error listing networks: {str(e)}")
+        
     def stop_discovery(self):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
@@ -494,8 +675,16 @@ class HostDiscoveryTab(QWidget):
         self.reset_ui()
         
         if results:
-            self.populate_results_table(results)
-            self.status_label.setText(f"Discovery complete. Found {len(results)} hosts.")
+            # results could be from extend discovery path
+            if isinstance(results, dict):
+                hosts = results.get('hosts', [])
+                extras = results.get('extras', [])
+                self.populate_results_table(hosts)
+                self.populate_extras_table(extras)
+                self.status_label.setText(f"Discovery complete. Found {len(hosts)} hosts and {len(extras)} services/devices.")
+            else:
+                self.populate_results_table(results)
+                self.status_label.setText(f"Discovery complete. Found {len(results)} hosts.")
             self.export_button.setEnabled(True)
         else:
             self.status_label.setText("Discovery complete. No hosts found.")
@@ -508,21 +697,63 @@ class HostDiscoveryTab(QWidget):
     def update_status(self, message):
         self.status_label.setText(message)
     
+    def on_discover_progress(self, current, total):
+        if total > 0:
+            pct = int((current / total) * 100)
+            self.progress_bar.setValue(pct)
+    
     def populate_results_table(self, results):
         self.results_table.setRowCount(len(results))
         
         for row, host in enumerate(results):
             self.results_table.setItem(row, 0, QTableWidgetItem(host.get('ip', 'Unknown')))
             self.results_table.setItem(row, 1, QTableWidgetItem(host.get('mac', 'Unknown')))
-            self.results_table.setItem(row, 2, QTableWidgetItem("Active"))
+            self.results_table.setItem(row, 2, QTableWidgetItem(host.get('hostname', '')))
+            self.results_table.setItem(row, 3, QTableWidgetItem("Active"))
+
+    def populate_extras_table(self, items):
+        self.extras_table.setRowCount(len(items))
+        for row, item in enumerate(items):
+            typ = item.get('type', '')
+            name = item.get('name', '') or item.get('ssid', '') or item.get('service_type', '')
+            addr = ''
+            port_or_rssi = ''
+            details = ''
+            if typ == 'mDNS':
+                addr = ", ".join(item.get('addresses', []))
+                port_or_rssi = str(item.get('port', ''))
+                props = item.get('properties', {})
+                details = ", ".join(f"{k}={v}" for k, v in props.items())
+            elif typ == 'SSDP':
+                addr = item.get('from', '')
+                details = item.get('location', '')
+                name = item.get('st', name)
+            elif typ == 'IPv6':
+                addr = item.get('ip', '')
+                details = item.get('mac', '')
+            elif typ == 'WiFi':
+                name = item.get('ssid', '')
+                addr = item.get('bssid', '')
+                port_or_rssi = str(item.get('rssi', ''))
+                details = item.get('security', '')
+            elif typ == 'BLE':
+                name = item.get('name', '') or item.get('address', '')
+                addr = item.get('address', '')
+                port_or_rssi = str(item.get('rssi', ''))
+            self.extras_table.setItem(row, 0, QTableWidgetItem(typ))
+            self.extras_table.setItem(row, 1, QTableWidgetItem(name))
+            self.extras_table.setItem(row, 2, QTableWidgetItem(addr))
+            self.extras_table.setItem(row, 3, QTableWidgetItem(port_or_rssi))
+            self.extras_table.setItem(row, 4, QTableWidgetItem(details))
     
     def reset_ui(self):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.progress_bar.setVisible(False)
+        self.progress_bar.setValue(0)
     
     def export_results(self):
-        if self.results_table.rowCount() == 0:
+        if self.results_table.rowCount() == 0 and getattr(self, 'extras_table', None) and self.extras_table.rowCount() == 0:
             QMessageBox.information(self, "Export", "No results to export.")
             return
         
@@ -535,12 +766,24 @@ class HostDiscoveryTab(QWidget):
         if file_path:
             try:
                 with open(file_path, 'w') as f:
-                    f.write("IP Address,MAC Address,Status\n")
+                    # Hosts
+                    f.write("[Hosts]\nIP Address,MAC Address,Hostname,Status\n")
                     for row in range(self.results_table.rowCount()):
                         ip = self.results_table.item(row, 0).text()
                         mac = self.results_table.item(row, 1).text()
-                        status = self.results_table.item(row, 2).text()
-                        f.write(f"{ip},{mac},{status}\n")
+                        hostname = self.results_table.item(row, 2).text()
+                        status = self.results_table.item(row, 3).text()
+                        f.write(f"{ip},{mac},{hostname},{status}\n")
+                    # Extras
+                    if getattr(self, 'extras_table', None):
+                        f.write("\n[Services & Nearby]\nType,Name/SSID,Address,Port/RSSI,Details\n")
+                        for row in range(self.extras_table.rowCount()):
+                            t = self.extras_table.item(row, 0).text() if self.extras_table.item(row, 0) else ''
+                            n = self.extras_table.item(row, 1).text() if self.extras_table.item(row, 1) else ''
+                            a = self.extras_table.item(row, 2).text() if self.extras_table.item(row, 2) else ''
+                            p = self.extras_table.item(row, 3).text() if self.extras_table.item(row, 3) else ''
+                            d = self.extras_table.item(row, 4).text() if self.extras_table.item(row, 4) else ''
+                            f.write(f"{t},{n},{a},{p},{d}\n")
                 
                 QMessageBox.information(self, "Export", f"Results exported to {file_path}")
             except Exception as e:
