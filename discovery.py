@@ -24,6 +24,9 @@ import asyncio
 import os
 from shutil import which
 
+# macOS airport utility path for Wi‑Fi info
+_AIRPORT_BIN = '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport'
+
 # Optional vendor lookup for MAC addresses
 try:
     from manuf import manuf as _manuf
@@ -105,7 +108,7 @@ class HostDiscoverer:
         resolve_hostnames: bool = False,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         batch_size: int = 128
-    ) -> List[Dict[str, str]]:
+    ) -e List[Dict[str, str]]:
         """
         Discover live hosts with optional hostname resolution and progress.
         
@@ -167,7 +170,12 @@ class HostDiscoverer:
             self.logger.info(f"Discovery completed. Found {len(results)} hosts")
             return results
         except Exception as e:
-            error_msg = f"ARP scan failed: {str(e)}"
+            msg = str(e)
+            # Fallback path: unprivileged discovery if ARP requires root (macOS BPF /dev/bpf0)
+            if 'Permission denied' in msg or 'cannot open BPF' in msg or '/dev/bpf' in msg:
+                self.logger.warning("ARP requires elevated privileges; falling back to unprivileged ping sweep")
+                return self._discover_hosts_unprivileged(target_range, resolve_hostnames, progress_callback)
+            error_msg = f"ARP scan failed: {msg}"
             self.logger.error(error_msg)
             raise RuntimeError(error_msg) from e
     
@@ -342,8 +350,35 @@ class HostDiscoverer:
             except Exception as e:
                 self.logger.debug(f"psutil fallback failed: {e}")
 
+        # Try to enrich with SSID label for Wi‑Fi interfaces on macOS
+        if platform.system() == 'Darwin':
+            for d in details:
+                if d.get('iface', '').startswith('en'):
+                    ssid = self._current_ssid_for_iface(d.get('iface', ''))
+                    if ssid:
+                        d['ssid'] = ssid
         return details
-    def get_local_networks(self) -> List[str]:
+
+    def _current_ssid_for_iface(self, iface: str) -> Optional[str]:
+        """Return the current SSID for a Wi‑Fi interface on macOS, if connected."""
+        try:
+            if platform.system() != 'Darwin' or not os.path.exists(_AIRPORT_BIN):
+                return None
+            # airport -I prints a status block; look for SSID: line
+            out = subprocess.check_output([_AIRPORT_BIN, '-I'], text=True, timeout=3)
+            ssid = None
+            for line in out.splitlines():
+                line = line.strip()
+                if line.lower().startswith('ssid:'):
+                    ssid = line.split(':', 1)[1].strip()
+                elif line.lower().startswith('agrctlrssi:'):
+                    # presence of block indicates valid; continue
+                    pass
+            return ssid
+        except Exception:
+            return None
+
+    def get_local_networks(self) -e List[str]:
         """
         Enumerate local networks (CIDRs).
         Returns list of CIDR strings.
@@ -553,6 +588,72 @@ class HostDiscoverer:
             extras.extend(self.list_wifi_networks())
         return {'hosts': hosts, 'extras': extras}
 
+
+    def _discover_hosts_unprivileged(
+        self,
+        target_range: str,
+        resolve_hostnames: bool = False,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> List[Dict[str, str]]:
+        """Unprivileged host discovery using ping sweep and ARP cache parsing.
+        This avoids raw packet capture and works without sudo on macOS.
+        """
+        try:
+            network = ipaddress.ip_network(target_range, strict=False)
+            hosts = [str(ip) for ip in network.hosts()]
+            total = len(hosts)
+            if total == 0:
+                return []
+            # Ping in small batches concurrently
+            import concurrent.futures
+            def ping(ip: str) -> Optional[str]:
+                try:
+                    # macOS ping uses -c count, -W timeout (in ms)
+                    subprocess.run(['ping', '-c', '1', '-W', '500', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return ip
+                except Exception:
+                    return None
+            responded: List[str] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+                futures = {ex.submit(ping, ip): ip for ip in hosts}
+                done = 0
+                for fut in concurrent.futures.as_completed(futures):
+                    val = fut.result()
+                    if val:
+                        responded.append(val)
+                    done += 1
+                    if progress_callback and done % 16 == 0:
+                        progress_callback(done, total)
+            # Parse ARP cache to get MACs
+            mac_map: Dict[str, str] = {}
+            try:
+                out = subprocess.check_output(['arp', '-an'], text=True, timeout=5)
+                for line in out.splitlines():
+                    # (? at ) at 1a:2b:... on en0 ifscope [ethernet]
+                    m = re.search(r'\((?P<ip>[^)]+)\) at (?P<mac>([0-9a-f]{2}:){5}[0-9a-f]{2})', line, re.IGNORECASE)
+                    if m:
+                        mac_map[m.group('ip')] = m.group('mac').lower()
+            except Exception:
+                pass
+            results: List[Dict[str, str]] = []
+            for ip in responded:
+                entry: Dict[str, str] = {'ip': ip, 'mac': mac_map.get(ip, '')}
+                # Optional reverse DNS
+                if resolve_hostnames:
+                    try:
+                        entry['hostname'] = socket.gethostbyaddr(ip)[0]
+                    except Exception:
+                        entry['hostname'] = ''
+                # Vendor
+                if entry.get('mac') and _manuf_parser is not None:
+                    try:
+                        entry['vendor'] = _manuf_parser.get_manuf_long(entry['mac']) or (_manuf_parser.get_manuf(entry['mac']) or '')
+                    except Exception:
+                        pass
+                results.append(entry)
+            return results
+        except Exception as e:
+            raise RuntimeError(f"Unprivileged discovery failed: {e}")
 
 def main():
     """
