@@ -24,6 +24,13 @@ import asyncio
 import os
 from shutil import which
 
+# Optional vendor lookup for MAC addresses
+try:
+    from manuf import manuf as _manuf
+    _manuf_parser = _manuf.MacParser()
+except Exception:
+    _manuf_parser = None
+
 try:
     from scapy.all import ARP, Ether, srp, conf, get_if_list, get_if_addr
     # Disable scapy's verbose output
@@ -135,7 +142,13 @@ class HostDiscoverer:
                 for _, received in answered_list:
                     ip = received.psrc
                     mac = received.hwsrc
-                    discovered[ip] = {'ip': ip, 'mac': mac}
+                    vendor = ''
+                    try:
+                        if _manuf_parser is not None and mac:
+                            vendor = _manuf_parser.get_manuf_long(mac) or (_manuf_parser.get_manuf(mac) or '')
+                    except Exception:
+                        vendor = ''
+                    discovered[ip] = {'ip': ip, 'mac': mac, 'vendor': vendor}
                     self.logger.debug(f"Discovered host: {ip} ({mac})")
                 
                 if progress_callback:
@@ -205,9 +218,138 @@ class HostDiscoverer:
         except ipaddress.AddressValueError as e:
             raise ValueError(f"Invalid network range: {e}")
 
+    def get_local_networks_detailed(self) -> List[Dict[str, str]]:
+        """
+        Enumerate local networks with interface detail.
+        Returns list of dicts: {'cidr','iface','ip','netmask'}
+        """
+        details: List[Dict[str, str]] = []
+
+        def _add_detail(ip_str: str, mask_str: str, iface: Optional[str] = None):
+            try:
+                net = ipaddress.IPv4Network(f"{ip_str}/{mask_str}", strict=False)
+                cidr = str(net)
+                if not any(d.get('cidr') == cidr for d in details):
+                    details.append({'cidr': cidr, 'iface': iface or '', 'ip': ip_str, 'netmask': str(net.netmask)})
+            except Exception:
+                pass
+
+        # Method 1: scapy route table (no interface names)
+        try:
+            for route in conf.route.routes:
+                if len(route) < 4:
+                    continue
+                net, mask = route[0], route[1]
+                try:
+                    net_ip = ipaddress.IPv4Address(net)
+                    mask_ip = ipaddress.IPv4Address(mask)
+                except Exception:
+                    continue
+                if int(net_ip) == 0 or int(mask_ip) == 0:
+                    continue
+                try:
+                    network = ipaddress.IPv4Network((int(net_ip), int(mask_ip)), strict=False)
+                    cidr = str(network)
+                    if not any(d.get('cidr') == cidr for d in details):
+                        details.append({'cidr': cidr, 'iface': '', 'ip': str(network.network_address), 'netmask': str(network.netmask)})
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.debug(f"Error reading local networks from routes: {e}")
+
+        # Method 2: scapy + psutil for iface/netmask
+        try:
+            for iface in get_if_list():
+                try:
+                    ip = get_if_addr(iface)
+                    mask = _get_netmask_for_iface(iface)
+                    if not ip or ip == '0.0.0.0' or not mask or mask == '0.0.0.0':
+                        continue
+                    _add_detail(ip, mask, iface)
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.debug(f"Error deriving networks from interfaces: {e}")
+
+        # Method 3: ifconfig parsing (macOS)
+        if platform.system() == 'Darwin':
+            try:
+                ifconfig_path = '/sbin/ifconfig' if os.path.exists('/sbin/ifconfig') else 'ifconfig'
+                out = subprocess.check_output([ifconfig_path, '-a'], text=True, timeout=5)
+                cur_iface = None
+                for line in out.splitlines():
+                    if not line.startswith('\t') and ':' in line:
+                        cur_iface = line.split(':', 1)[0]
+                    line = line.strip()
+                    if line.startswith('inet '):
+                        parts = line.split()
+                        try:
+                            ip = parts[1]
+                            mask_str = ''
+                            if 'netmask' in parts:
+                                nm_idx = parts.index('netmask')
+                                nm_val = parts[nm_idx + 1]
+                                if nm_val.startswith('0x'):
+                                    nm_int = int(nm_val, 16)
+                                    mask_str = socket.inet_ntoa(nm_int.to_bytes(4, 'big'))
+                                else:
+                                    mask_str = nm_val
+                            if ip and mask_str:
+                                _add_detail(ip, mask_str, cur_iface)
+                        except Exception:
+                            continue
+            except Exception as e:
+                self.logger.debug(f"ifconfig parsing failed: {e}")
+
+        # Method 4: networksetup/ipconfig (macOS)
+        if platform.system() == 'Darwin':
+            try:
+                networksetup_path = '/usr/sbin/networksetup' if os.path.exists('/usr/sbin/networksetup') else 'networksetup'
+                ipconfig_path = '/usr/sbin/ipconfig' if os.path.exists('/usr/sbin/ipconfig') else 'ipconfig'
+                hwports = subprocess.check_output([networksetup_path, '-listallhardwareports'], text=True, timeout=5)
+                device = None
+                cur_name = None
+                for line in hwports.splitlines():
+                    if line.startswith('Hardware Port:'):
+                        cur_name = line.split(':', 1)[1].strip()
+                    if line.startswith('Device:'):
+                        dev = line.split(':', 1)[1].strip()
+                        if cur_name in ('Wi-Fi', 'Ethernet'):
+                            device = dev
+                            break
+                if device:
+                    try:
+                        ip = subprocess.check_output([ipconfig_path, 'getifaddr', device], text=True, timeout=3).strip()
+                        nm = subprocess.check_output([ipconfig_path, 'getifnetmask', device], text=True, timeout=3).strip()
+                        if ip and nm:
+                            _add_detail(ip, nm, device)
+                    except Exception:
+                        pass
+            except Exception as e:
+                self.logger.debug(f"networksetup/ipconfig failed: {e}")
+
+        # Method 5: psutil fallback
+        if _psutil is not None:
+            try:
+                addrs = _psutil.net_if_addrs()
+                for iface, infos in addrs.items():
+                    for i in infos:
+                        if getattr(i, 'family', None) == socket.AF_INET:
+                            ip = i.address
+                            mask = i.netmask
+                            if ip and mask and ip != '127.0.0.1':
+                                _add_detail(ip, mask, iface)
+            except Exception as e:
+                self.logger.debug(f"psutil fallback failed: {e}")
+
+        return details
+
     def get_local_networks(self) -> List[str]:
         """
         Enumerate local networks (CIDRs) using multiple strategies on macOS:
+        Returns list of CIDR strings.
+        """
+        return [d['cidr'] for d in self.get_local_networks_detailed()]
         1) scapy route table (IPv4)
         2) scapy interface IP/netmask
         3) ifconfig parsing

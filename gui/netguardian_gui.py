@@ -590,8 +590,8 @@ class HostDiscoveryTab(QWidget):
         # Hosts table
         host_label = QLabel("Hosts (ARP)")
         self.results_table = QTableWidget()
-        self.results_table.setColumnCount(4)
-        self.results_table.setHorizontalHeaderLabels(["IP Address", "MAC Address", "Hostname", "Status"])
+        self.results_table.setColumnCount(5)
+        self.results_table.setHorizontalHeaderLabels(["IP Address", "MAC Address", "Vendor", "Hostname", "Status"])
         self.results_table.horizontalHeader().setStretchLastSection(True)
         results_layout.addWidget(host_label)
         results_layout.addWidget(self.results_table)
@@ -647,13 +647,25 @@ class HostDiscoveryTab(QWidget):
     def load_local_networks(self):
         try:
             discoverer = HostDiscoverer()
-            nets = discoverer.get_local_networks()
-            self.local_networks_cached = nets
+            nets_detailed = []
+            try:
+                nets_detailed = discoverer.get_local_networks_detailed()  # type: ignore[attr-defined]
+            except Exception:
+                # Fallback to legacy list
+                nets = discoverer.get_local_networks()
+                nets_detailed = [{'cidr': n, 'iface': '', 'ip': '', 'netmask': ''} for n in nets]
+            self.local_networks_cached = nets_detailed
             self.local_nets_combo.clear()
-            if nets:
-                self.local_nets_combo.addItems(nets)
-                # When selecting, update target input
-                self.local_nets_combo.currentTextChanged.connect(lambda text: self.target_input.setText(text))
+            if nets_detailed:
+                for item in nets_detailed:
+                    display = f"{(item.get('iface') or 'iface?')} · {item.get('cidr')}" if item.get('iface') else item.get('cidr')
+                    self.local_nets_combo.addItem(display, userData=item.get('cidr'))
+                # When selecting, set target input to CIDR from userData
+                def _on_change(_text):
+                    data = self.local_nets_combo.currentData()
+                    if data:
+                        self.target_input.setText(str(data))
+                self.local_nets_combo.currentTextChanged.connect(_on_change)
             else:
                 self.local_nets_combo.addItem("No local networks found")
         except Exception as e:
@@ -708,8 +720,9 @@ class HostDiscoveryTab(QWidget):
         for row, host in enumerate(results):
             self.results_table.setItem(row, 0, QTableWidgetItem(host.get('ip', 'Unknown')))
             self.results_table.setItem(row, 1, QTableWidgetItem(host.get('mac', 'Unknown')))
-            self.results_table.setItem(row, 2, QTableWidgetItem(host.get('hostname', '')))
-            self.results_table.setItem(row, 3, QTableWidgetItem("Active"))
+            self.results_table.setItem(row, 2, QTableWidgetItem(host.get('vendor', '')))
+            self.results_table.setItem(row, 3, QTableWidgetItem(host.get('hostname', '')))
+            self.results_table.setItem(row, 4, QTableWidgetItem("Active"))
 
     def populate_extras_table(self, items):
         self.extras_table.setRowCount(len(items))
