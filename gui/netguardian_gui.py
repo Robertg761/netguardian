@@ -780,13 +780,14 @@ class HostDiscoveryTab(QWidget):
             try:
                 with open(file_path, 'w') as f:
                     # Hosts
-                    f.write("[Hosts]\nIP Address,MAC Address,Hostname,Status\n")
+                    f.write("[Hosts]\nIP Address,MAC Address,Vendor,Hostname,Status\n")
                     for row in range(self.results_table.rowCount()):
-                        ip = self.results_table.item(row, 0).text()
-                        mac = self.results_table.item(row, 1).text()
-                        hostname = self.results_table.item(row, 2).text()
-                        status = self.results_table.item(row, 3).text()
-                        f.write(f"{ip},{mac},{hostname},{status}\n")
+                        ip = self.results_table.item(row, 0).text() if self.results_table.item(row, 0) else ''
+                        mac = self.results_table.item(row, 1).text() if self.results_table.item(row, 1) else ''
+                        vendor = self.results_table.item(row, 2).text() if self.results_table.item(row, 2) else ''
+                        hostname = self.results_table.item(row, 3).text() if self.results_table.item(row, 3) else ''
+                        status = self.results_table.item(row, 4).text() if self.results_table.item(row, 4) else ''
+                        f.write(f"{ip},{mac},{vendor},{hostname},{status}\n")
                     # Extras
                     if getattr(self, 'extras_table', None):
                         f.write("\n[Services & Nearby]\nType,Name/SSID,Address,Port/RSSI,Details\n")

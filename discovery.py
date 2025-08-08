@@ -343,142 +343,15 @@ class HostDiscoverer:
                 self.logger.debug(f"psutil fallback failed: {e}")
 
         return details
-
     def get_local_networks(self) -> List[str]:
         """
-        Enumerate local networks (CIDRs) using multiple strategies on macOS:
+        Enumerate local networks (CIDRs).
         Returns list of CIDR strings.
         """
-        return [d['cidr'] for d in self.get_local_networks_detailed()]
-        1) scapy route table (IPv4)
-        2) scapy interface IP/netmask
-        3) ifconfig parsing
-        4) networksetup + ipconfig for Wi‑Fi/Ethernet as a last resort
-        Returns list of CIDR strings.
-        """
-        networks: List[str] = []
-
-        def _add_cidr(ip_str: str, mask_str: str):
-            try:
-                net = ipaddress.IPv4Network(f"{ip_str}/{mask_str}", strict=False)
-                cidr = str(net)
-                if cidr not in networks:
-                    networks.append(cidr)
-            except Exception:
-                pass
-
-        # Method 1: Parse scapy route table (IPv4 only)
         try:
-            for route in conf.route.routes:
-                if len(route) < 4:
-                    continue
-                net, mask = route[0], route[1]
-                try:
-                    net_ip = ipaddress.IPv4Address(net)
-                    mask_ip = ipaddress.IPv4Address(mask)
-                except Exception:
-                    continue
-                if int(net_ip) == 0 or int(mask_ip) == 0:
-                    continue
-                try:
-                    network = ipaddress.IPv4Network((int(net_ip), int(mask_ip)), strict=False)
-                    cidr = str(network)
-                    if cidr not in networks:
-                        networks.append(cidr)
-                except Exception:
-                    continue
-        except Exception as e:
-            self.logger.debug(f"Error reading local networks from routes: {e}")
-
-        # Method 2: Derive from scapy interface IP and psutil netmask
-        if not networks:
-            try:
-                for iface in get_if_list():
-                    try:
-                        ip = get_if_addr(iface)
-                        mask = _get_netmask_for_iface(iface)
-                        if not ip or ip == '0.0.0.0' or not mask or mask == '0.0.0.0':
-                            continue
-                        _add_cidr(ip, mask)
-                    except Exception:
-                        continue
-            except Exception as e:
-                self.logger.debug(f"Error deriving networks from interfaces: {e}")
-
-        # Method 3: Parse `ifconfig` output (macOS)
-        if not networks and platform.system() == 'Darwin':
-            try:
-                ifconfig_path = '/sbin/ifconfig' if os.path.exists('/sbin/ifconfig') else 'ifconfig'
-                out = subprocess.check_output([ifconfig_path, '-a'], text=True, timeout=5)
-                cur_iface = None
-                for line in out.splitlines():
-                    if not line.startswith('\t') and ':' in line:
-                        cur_iface = line.split(':', 1)[0]
-                    line = line.strip()
-                    if line.startswith('inet '):
-                        parts = line.split()
-                        # Expected: inet <ip> netmask <hex> broadcast <ip>
-                        try:
-                            ip = parts[1]
-                            if 'netmask' in parts:
-                                nm_idx = parts.index('netmask')
-                                nm_val = parts[nm_idx + 1]
-                                if nm_val.startswith('0x'):
-                                    # Convert hex netmask (e.g., 0xffffff00) to dotted
-                                    nm_int = int(nm_val, 16)
-                                    mask_str = socket.inet_ntoa(nm_int.to_bytes(4, 'big'))
-                                else:
-                                    mask_str = nm_val
-                                _add_cidr(ip, mask_str)
-                        except Exception:
-                            continue
-            except Exception as e:
-                self.logger.debug(f"ifconfig parsing failed: {e}")
-
-        # Method 4: Use networksetup to find Wi‑Fi/Ethernet service and ipconfig for IP
-        if not networks and platform.system() == 'Darwin':
-            try:
-                networksetup_path = '/usr/sbin/networksetup' if os.path.exists('/usr/sbin/networksetup') else 'networksetup'
-                ipconfig_path = '/usr/sbin/ipconfig' if os.path.exists('/usr/sbin/ipconfig') else 'ipconfig'
-                hwports = subprocess.check_output([networksetup_path, '-listallhardwareports'], text=True, timeout=5)
-                # Map Service names to devices (Device: en0)
-                device = None
-                cur_name = None
-                for line in hwports.splitlines():
-                    if line.startswith('Hardware Port:'):
-                        cur_name = line.split(':', 1)[1].strip()
-                    if line.startswith('Device:'):
-                        dev = line.split(':', 1)[1].strip()
-                        # Prefer Wi-Fi or Ethernet
-                        if cur_name in ('Wi-Fi', 'Ethernet'):
-                            device = dev
-                            break
-                if device:
-                    try:
-                        ip = subprocess.check_output([ipconfig_path, 'getifaddr', device], text=True, timeout=3).strip()
-                        nm = subprocess.check_output([ipconfig_path, 'getifnetmask', device], text=True, timeout=3).strip()
-                        if ip and nm:
-                            _add_cidr(ip, nm)
-                    except Exception:
-                        pass
-            except Exception as e:
-                self.logger.debug(f"networksetup/ipconfig failed: {e}")
-
-        # Method 5: psutil fallback (cross-platform)
-        if not networks:
-            try:
-                import psutil
-                addrs = psutil.net_if_addrs()
-                for iface, infos in addrs.items():
-                    ipv4 = [i for i in infos if getattr(i, 'family', None) == socket.AF_INET]
-                    for i in ipv4:
-                        ip = i.address
-                        mask = i.netmask
-                        if ip and mask and ip != '127.0.0.1':
-                            _add_cidr(ip, mask)
-            except Exception as e:
-                self.logger.debug(f"psutil fallback failed: {e}")
-
+            return [d['cidr'] for d in self.get_local_networks_detailed()]
+        except Exception:
+            return []
         return networks
 
     # ------------ Extended discovery features -------------
