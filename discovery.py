@@ -108,7 +108,7 @@ class HostDiscoverer:
         resolve_hostnames: bool = False,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         batch_size: int = 128
-    ) -e List[Dict[str, str]]:
+    ) -> List[Dict[str, str]]:
         """
         Discover live hosts with optional hostname resolution and progress.
         
@@ -378,7 +378,7 @@ class HostDiscoverer:
         except Exception:
             return None
 
-    def get_local_networks(self) -e List[str]:
+    def get_local_networks(self) -> List[str]:
         """
         Enumerate local networks (CIDRs).
         Returns list of CIDR strings.
@@ -387,7 +387,6 @@ class HostDiscoverer:
             return [d['cidr'] for d in self.get_local_networks_detailed()]
         except Exception:
             return []
-        return networks
 
     # ------------ Extended discovery features -------------
     def discover_mdns_services(self, timeout: float = 5.0) -> List[Dict[str, Any]]:
