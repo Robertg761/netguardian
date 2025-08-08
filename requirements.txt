@@ -7,6 +7,9 @@ scapy>=2.4.5
 # Python interface to nmap
 python-nmap>=0.7.1
 
+# GUI framework (for graphical interface)
+PyQt6>=6.5
+
 # Standard library modules (no installation needed):
 # - argparse (for command-line interface)
 # - logging (for logging functionality)  

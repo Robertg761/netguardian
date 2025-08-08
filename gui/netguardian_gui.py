@@ -29,8 +29,10 @@ from PyQt6.QtGui import (
     QPainter, QBrush, QPen
 )
 
-# Add the NetGuardian path to import the modules
-sys.path.insert(0, '/Users/robert/NetGuardian')
+# Add the NetGuardian path to import the modules (resolve dynamically)
+PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 try:
     from discovery import HostDiscoverer
@@ -302,6 +304,7 @@ class NetworkWorker(QThread):
     finished = pyqtSignal(str, object)  # operation_type, results
     progress = pyqtSignal(str)  # status message
     error = pyqtSignal(str)  # error message
+    packet = pyqtSignal(dict)  # per-packet signal for sniffing
     
     def __init__(self, operation_type: str, **kwargs):
         super().__init__()
@@ -355,10 +358,19 @@ class NetworkWorker(QThread):
         filter_expr = self.kwargs.get('filter', '')
         
         self.progress.emit(f"Capturing {count} packets on {interface}...")
-        # Note: This is a simplified version. Real implementation would need
-        # to handle the packet capture differently for GUI integration
-        self.progress.emit("Packet capture complete.")
-        self.finished.emit('sniff', {'message': 'Packet capture completed'})
+        
+        try:
+            sniffer.start_sniffing(
+                interface=interface,
+                count=count,
+                filter_expr=filter_expr,
+                on_packet=lambda info: self.packet.emit(info),
+                verbose_print=False
+            )
+            self.progress.emit("Packet capture complete.")
+            self.finished.emit('sniff', {'message': 'Packet capture completed'})
+        except Exception as e:
+            self.error.emit(str(e))
     
     def vulnerability_test(self):
         self.progress.emit("Starting vulnerability test...")
@@ -779,7 +791,15 @@ class PacketSnifferTab(QWidget):
         config_layout = QFormLayout()
         
         self.interface_combo = QComboBox()
-        self.interface_combo.addItems(["en0", "en1", "eth0", "wlan0"])
+        # Populate interfaces dynamically with fallback values
+        try:
+            from sniffer import PacketSniffer
+            interfaces = PacketSniffer().get_available_interfaces()
+        except Exception:
+            interfaces = []
+        if not interfaces:
+            interfaces = ["en0", "en1", "eth0", "wlan0"]
+        self.interface_combo.addItems(interfaces)
         config_layout.addRow("Interface:", self.interface_combo)
         
         self.packet_count = QSpinBox()
@@ -925,6 +945,7 @@ class PacketSnifferTab(QWidget):
         self.worker.progress.connect(self.update_status)
         self.worker.finished.connect(self.capture_finished)
         self.worker.error.connect(self.capture_error)
+        self.worker.packet.connect(self.on_packet)
         self.worker.start()
     
     def stop_capture(self):
@@ -948,6 +969,31 @@ class PacketSnifferTab(QWidget):
     
     def update_status(self, message):
         self.status_label.setText(message)
+    
+    def on_packet(self, info: dict):
+        # Append to internal list
+        self.captured_packets.append(info)
+        # Update table
+        row = self.packet_table.rowCount()
+        self.packet_table.insertRow(row)
+        # Fill columns: Time, Source, Destination, Protocol, Length, Info
+        self.packet_table.setItem(row, 0, QTableWidgetItem(info.get('time', '')))
+        self.packet_table.setItem(row, 1, QTableWidgetItem(info.get('src', '')))
+        self.packet_table.setItem(row, 2, QTableWidgetItem(info.get('dst', '')))
+        self.packet_table.setItem(row, 3, QTableWidgetItem(info.get('protocol', '')))
+        # Length not currently provided; leave blank or N/A
+        self.packet_table.setItem(row, 4, QTableWidgetItem(str(info.get('length', ''))))
+        self.packet_table.setItem(row, 5, QTableWidgetItem(info.get('info', '')))
+        # Update stats
+        proto_key = info.get('protocol', 'other').lower()
+        total = int(self.stats_labels['total'].text()) + 1
+        self.stats_labels['total'].setText(str(total))
+        if proto_key in self.stats_labels:
+            count = int(self.stats_labels[proto_key].text()) + 1
+            self.stats_labels[proto_key].setText(str(count))
+        else:
+            count = int(self.stats_labels['other'].text()) + 1
+            self.stats_labels['other'].setText(str(count))
     
     def packet_selected(self):
         current_row = self.packet_table.currentRow()
