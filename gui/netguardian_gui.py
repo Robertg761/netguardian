@@ -30,93 +30,27 @@ from PyQt6.QtGui import (
 )
 
 # Add NetGuardian project paths so bundled app can import local modules
-try:
-    if getattr(sys, 'frozen', False):
-        # When frozen, rely on PyInstaller's importer for embedded modules.
-        # Do NOT modify sys.path to avoid shadowing embedded modules with data files.
-        pass
-    else:
-        PROJECT_ROOT = Path(__file__).resolve().parents[1]
-        for p in (PROJECT_ROOT, PROJECT_ROOT / 'gui'):
-            p_str = str(p)
-            if p_str not in sys.path:
-                sys.path.insert(0, p_str)
-except Exception:
-    pass
+# Add the project root to the path to allow for direct imports
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    # Import project modules normally (PyInstaller hiddenimports embed them)
+    # Import project modules normally
     from discovery import HostDiscoverer
     from scanner import PortScanner
     from sniffer import PacketSniffer
     from vuln_testing import VulnerabilityTester
     from advanced_testing import EthicalTester
 except ImportError as e:
-    # Fallback: attempt dynamic loading of modules from bundled data under Resources/modules
-    try:
-        import importlib.util as _il
-        def _load_module(mod_name, filename_candidates):
-            for fp in filename_candidates:
-                try:
-                    p = Path(fp)
-                    # Debug: show each candidate
-                    # print(f"Trying {mod_name} from {p}")
-                    if p.exists() and p.is_file():
-                        # Read as text to guard against corrupted/binary files
-                        data = p.read_bytes()
-                        if b"\x00" in data:
-                            # print(f"Skipping {p} due to null bytes")
-                            continue
-                        spec = _il.spec_from_file_location(mod_name, str(p))
-                        if spec and spec.loader:
-                            m = _il.module_from_spec(spec)
-                            spec.loader.exec_module(m)
-                            sys.modules[mod_name] = m
-                            return m
-                except Exception:
-                    continue
-            raise ImportError(f"Could not dynamically load {mod_name}")
-        # Determine candidate roots
-        roots = []
-        if getattr(sys, 'frozen', False):
-            macos_dir = Path(sys.executable).resolve().parent              # Contents/MacOS
-            resources_dir = macos_dir.parent / 'Resources'                 # Contents/Resources
-            modules_dir = resources_dir / 'modules'
-            # Make modules importable via normal import as well
-            if str(modules_dir) not in sys.path:
-                sys.path.insert(0, str(modules_dir))
-            roots.extend([modules_dir, resources_dir])
-        else:
-            roots.append(Path(__file__).resolve().parents[1])
-        # Build candidate file lists
-        def cands(name):
-            files = []
-            for r in roots:
-                files.append(r / f"{name}.py")
-                files.append(r / 'gui' / f"{name}.py")
-            return files
-        # Try normal import again in case sys.path was updated
-        try:
-            from discovery import HostDiscoverer  # type: ignore
-            from scanner import PortScanner  # type: ignore
-            from sniffer import PacketSniffer  # type: ignore
-            from vuln_testing import VulnerabilityTester  # type: ignore
-            from advanced_testing import EthicalTester  # type: ignore
-        except Exception:
-            dmod = _load_module('discovery', cands('discovery'))
-            smod = _load_module('scanner', cands('scanner'))
-            snmod = _load_module('sniffer', cands('sniffer'))
-            vmod = _load_module('vuln_testing', cands('vuln_testing'))
-            amod = _load_module('advanced_testing', cands('advanced_testing'))
-            HostDiscoverer = getattr(dmod, 'HostDiscoverer')
-            PortScanner = getattr(smod, 'PortScanner', None) or getattr(smod, 'PortScanner')
-            PacketSniffer = getattr(snmod, 'PacketSniffer')
-            VulnerabilityTester = getattr(vmod, 'VulnerabilityTester', None)
-            EthicalTester = getattr(amod, 'EthicalTester', None)
-            print("NetGuardian modules loaded via dynamic fallback")
-    except Exception as e2:
-        print(f"Warning: Could not import NetGuardian modules: {e2}")
-        print("GUI will run in demo mode.")
+    print(f"Warning: Could not import NetGuardian modules: {e}")
+    print("GUI will run in demo mode.")
+    # Define dummy classes for demo mode
+    class HostDiscoverer: pass
+    class PortScanner: pass
+    class PacketSniffer: pass
+    class VulnerabilityTester: pass
+    class EthicalTester: pass
 
 
 class ModernStyle:

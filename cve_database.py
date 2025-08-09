@@ -17,10 +17,8 @@ from pathlib import Path
 
 try:
     import requests
-    HAS_REQUESTS = True
 except ImportError:
-    HAS_REQUESTS = False
-    print("Warning: requests not available. Install with: pip install requests")
+    raise ImportError("requests is required for CVE lookups. Install with: pip install requests")
 
 class CVEDatabase:
     """

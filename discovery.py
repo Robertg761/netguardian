@@ -140,7 +140,9 @@ class HostDiscoverer:
                 arp_request = ARP(pdst=batch_ips)
                 pkt = broadcast / arp_request
                 self.logger.debug(f"Sending ARP batch {i}-{i+len(batch_ips)-1} with timeout {self.timeout}s")
+                self.logger.info("Attempting privileged ARP scan...")
                 answered_list = srp(pkt, timeout=self.timeout, verbose=False)[0]
+                self.logger.info("Privileged ARP scan finished.")
                 
                 for _, received in answered_list:
                     ip = received.psrc
@@ -171,8 +173,9 @@ class HostDiscoverer:
             return results
         except Exception as e:
             msg = str(e)
+            self.logger.error(f"ARP scan failed with message: {msg}")
             # Fallback path: unprivileged discovery if ARP requires root (macOS BPF /dev/bpf0)
-            if 'Permission denied' in msg or 'cannot open BPF' in msg or '/dev/bpf' in msg:
+            if 'Permission denied' in msg or 'Operation not permitted' in msg or 'cannot open BPF' in msg or '/dev/bpf' in msg:
                 self.logger.warning("ARP requires elevated privileges; falling back to unprivileged ping sweep")
                 return self._discover_hosts_unprivileged(target_range, resolve_hostnames, progress_callback)
             error_msg = f"ARP scan failed: {msg}"
@@ -396,6 +399,9 @@ class HostDiscoverer:
         """
         try:
             from zeroconf import Zeroconf, ServiceBrowser
+        except ImportError:
+            self.logger.error("zeroconf is required for mDNS discovery. Install with: pip install zeroconf")
+            return []
         except Exception as e:
             self.logger.debug(f"zeroconf not available: {e}")
             return []
@@ -511,6 +517,9 @@ class HostDiscoverer:
     async def _ble_scan_async(self, timeout: float = 5.0) -> List[Dict[str, Any]]:
         try:
             from bleak import BleakScanner
+        except ImportError:
+            self.logger.error("bleak is required for BLE scanning. Install with: pip install bleak")
+            return []
         except Exception as e:
             self.logger.debug(f"bleak not available: {e}")
             return []
@@ -607,10 +616,25 @@ class HostDiscoverer:
             import concurrent.futures
             def ping(ip: str) -> Optional[str]:
                 try:
-                    # macOS ping uses -c count, -W timeout (in ms)
-                    subprocess.run(['ping', '-c', '1', '-W', '500', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return ip
-                except Exception:
+                    # Platform-aware ping command with a 1-second timeout and no DNS lookup
+                    system = platform.system()
+                    if system == 'Darwin':
+                        cmd = ['ping', '-n', '-c', '1', '-t', '1', ip]
+                    else:  # Linux and other UNIX-like systems
+                        cmd = ['ping', '-n', '-c', '1', '-W', '1', ip]
+
+                    self.logger.debug(f"Pinging {ip} with command: {' '.join(cmd)}")
+                    start_time = time.time()
+                    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                    duration = time.time() - start_time
+                    self.logger.debug(f"Pinged {ip} in {duration:.2f}s. Return code: {result.returncode}")
+
+                    return ip if result.returncode == 0 else None
+                except subprocess.TimeoutExpired:
+                    self.logger.warning(f"Ping to {ip} timed out.")
+                    return None
+                except Exception as e:
+                    self.logger.error(f"Ping to {ip} failed: {e}")
                     return None
             responded: List[str] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
