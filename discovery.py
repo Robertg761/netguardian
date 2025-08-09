@@ -353,19 +353,57 @@ class HostDiscoverer:
             except Exception as e:
                 self.logger.debug(f"psutil fallback failed: {e}")
 
-        # Try to enrich with SSID label for Wi‑Fi interfaces on macOS
-        if platform.system() == 'Darwin':
+        # Try to enrich with SSID label for Wi‑Fi interfaces
+        system = platform.system()
+        if system == 'Darwin':
             for d in details:
                 if d.get('iface', '').startswith('en'):
-                    ssid = self._current_ssid_for_iface(d.get('iface', ''))
+                    ssid = self._current_ssid_for_iface_macos(d.get('iface', ''))
                     if ssid:
                         d['ssid'] = ssid
+        elif system == 'Linux':
+            for d in details:
+                if d.get('iface', '').startswith(('wlan', 'wlp', 'wifi')):
+                    ssid = self._get_ssid_linux(d.get('iface', ''))
+                    if ssid:
+                        d['ssid'] = ssid
+        elif system == 'Windows':
+            ssid = self._get_ssid_windows()
+            if ssid:
+                # On Windows, it's hard to map an SSID to a specific interface easily
+                # so we'll just add it to the first Wi-Fi interface found.
+                for d in details:
+                    if d.get('iface', '').lower().startswith('wi-fi'):
+                        d['ssid'] = ssid
+                        break
         return details
 
-    def _current_ssid_for_iface(self, iface: str) -> Optional[str]:
+    def _get_ssid_linux(self, iface: str) -> Optional[str]:
+        """Return the current SSID for a Wi-Fi interface on Linux."""
+        try:
+            # First, try iwgetid (most common and simple)
+            out = subprocess.check_output(['iwgetid', '-r', iface], text=True, timeout=3)
+            return out.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fallback to nmcli (common on systems with NetworkManager)
+            try:
+                out = subprocess.check_output(
+                    ['nmcli', '-t', '-f', 'active,ssid', 'dev', 'wifi'],
+                    text=True, timeout=3
+                )
+                for line in out.splitlines():
+                    if line.startswith('yes:'):
+                        return line.split(':', 1)[1]
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+        except Exception as e:
+            self.logger.debug(f"Error getting SSID for {iface} on Linux: {e}")
+        return None
+
+    def _current_ssid_for_iface_macos(self, iface: str) -> Optional[str]:
         """Return the current SSID for a Wi‑Fi interface on macOS, if connected."""
         try:
-            if platform.system() != 'Darwin' or not os.path.exists(_AIRPORT_BIN):
+            if not os.path.exists(_AIRPORT_BIN):
                 return None
             # airport -I prints a status block; look for SSID: line
             out = subprocess.check_output([_AIRPORT_BIN, '-I'], text=True, timeout=3)
@@ -380,6 +418,22 @@ class HostDiscoverer:
             return ssid
         except Exception:
             return None
+
+    def _get_ssid_windows(self) -> Optional[str]:
+        """Return the current SSID on Windows."""
+        try:
+            out = subprocess.check_output(
+                ['netsh', 'wlan', 'show', 'interfaces'],
+                text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            for line in out.splitlines():
+                if 'SSID' in line and ':' in line:
+                    return line.split(':', 1)[1].strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+        except Exception as e:
+            self.logger.debug(f"Error getting SSID on Windows: {e}")
+        return None
 
     def get_local_networks(self) -> List[str]:
         """
