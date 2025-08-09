@@ -140,7 +140,9 @@ class HostDiscoverer:
                 arp_request = ARP(pdst=batch_ips)
                 pkt = broadcast / arp_request
                 self.logger.debug(f"Sending ARP batch {i}-{i+len(batch_ips)-1} with timeout {self.timeout}s")
+                self.logger.info("Attempting privileged ARP scan...")
                 answered_list = srp(pkt, timeout=self.timeout, verbose=False)[0]
+                self.logger.info("Privileged ARP scan finished.")
                 
                 for _, received in answered_list:
                     ip = received.psrc
@@ -171,8 +173,9 @@ class HostDiscoverer:
             return results
         except Exception as e:
             msg = str(e)
+            self.logger.error(f"ARP scan failed with message: {msg}")
             # Fallback path: unprivileged discovery if ARP requires root (macOS BPF /dev/bpf0)
-            if 'Permission denied' in msg or 'cannot open BPF' in msg or '/dev/bpf' in msg:
+            if 'Permission denied' in msg or 'Operation not permitted' in msg or 'cannot open BPF' in msg or '/dev/bpf' in msg:
                 self.logger.warning("ARP requires elevated privileges; falling back to unprivileged ping sweep")
                 return self._discover_hosts_unprivileged(target_range, resolve_hostnames, progress_callback)
             error_msg = f"ARP scan failed: {msg}"
@@ -350,19 +353,57 @@ class HostDiscoverer:
             except Exception as e:
                 self.logger.debug(f"psutil fallback failed: {e}")
 
-        # Try to enrich with SSID label for Wi‑Fi interfaces on macOS
-        if platform.system() == 'Darwin':
+        # Try to enrich with SSID label for Wi‑Fi interfaces
+        system = platform.system()
+        if system == 'Darwin':
             for d in details:
                 if d.get('iface', '').startswith('en'):
-                    ssid = self._current_ssid_for_iface(d.get('iface', ''))
+                    ssid = self._current_ssid_for_iface_macos(d.get('iface', ''))
                     if ssid:
                         d['ssid'] = ssid
+        elif system == 'Linux':
+            for d in details:
+                if d.get('iface', '').startswith(('wlan', 'wlp', 'wifi')):
+                    ssid = self._get_ssid_linux(d.get('iface', ''))
+                    if ssid:
+                        d['ssid'] = ssid
+        elif system == 'Windows':
+            ssid = self._get_ssid_windows()
+            if ssid:
+                # On Windows, it's hard to map an SSID to a specific interface easily
+                # so we'll just add it to the first Wi-Fi interface found.
+                for d in details:
+                    if d.get('iface', '').lower().startswith('wi-fi'):
+                        d['ssid'] = ssid
+                        break
         return details
 
-    def _current_ssid_for_iface(self, iface: str) -> Optional[str]:
+    def _get_ssid_linux(self, iface: str) -> Optional[str]:
+        """Return the current SSID for a Wi-Fi interface on Linux."""
+        try:
+            # First, try iwgetid (most common and simple)
+            out = subprocess.check_output(['iwgetid', '-r', iface], text=True, timeout=3)
+            return out.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fallback to nmcli (common on systems with NetworkManager)
+            try:
+                out = subprocess.check_output(
+                    ['nmcli', '-t', '-f', 'active,ssid', 'dev', 'wifi'],
+                    text=True, timeout=3
+                )
+                for line in out.splitlines():
+                    if line.startswith('yes:'):
+                        return line.split(':', 1)[1]
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+        except Exception as e:
+            self.logger.debug(f"Error getting SSID for {iface} on Linux: {e}")
+        return None
+
+    def _current_ssid_for_iface_macos(self, iface: str) -> Optional[str]:
         """Return the current SSID for a Wi‑Fi interface on macOS, if connected."""
         try:
-            if platform.system() != 'Darwin' or not os.path.exists(_AIRPORT_BIN):
+            if not os.path.exists(_AIRPORT_BIN):
                 return None
             # airport -I prints a status block; look for SSID: line
             out = subprocess.check_output([_AIRPORT_BIN, '-I'], text=True, timeout=3)
@@ -377,6 +418,22 @@ class HostDiscoverer:
             return ssid
         except Exception:
             return None
+
+    def _get_ssid_windows(self) -> Optional[str]:
+        """Return the current SSID on Windows."""
+        try:
+            out = subprocess.check_output(
+                ['netsh', 'wlan', 'show', 'interfaces'],
+                text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            for line in out.splitlines():
+                if 'SSID' in line and ':' in line:
+                    return line.split(':', 1)[1].strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+        except Exception as e:
+            self.logger.debug(f"Error getting SSID on Windows: {e}")
+        return None
 
     def get_local_networks(self) -> List[str]:
         """
@@ -396,6 +453,9 @@ class HostDiscoverer:
         """
         try:
             from zeroconf import Zeroconf, ServiceBrowser
+        except ImportError:
+            self.logger.error("zeroconf is required for mDNS discovery. Install with: pip install zeroconf")
+            return []
         except Exception as e:
             self.logger.debug(f"zeroconf not available: {e}")
             return []
@@ -511,6 +571,9 @@ class HostDiscoverer:
     async def _ble_scan_async(self, timeout: float = 5.0) -> List[Dict[str, Any]]:
         try:
             from bleak import BleakScanner
+        except ImportError:
+            self.logger.error("bleak is required for BLE scanning. Install with: pip install bleak")
+            return []
         except Exception as e:
             self.logger.debug(f"bleak not available: {e}")
             return []
@@ -607,10 +670,25 @@ class HostDiscoverer:
             import concurrent.futures
             def ping(ip: str) -> Optional[str]:
                 try:
-                    # macOS ping uses -c count, -W timeout (in ms)
-                    subprocess.run(['ping', '-c', '1', '-W', '500', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return ip
-                except Exception:
+                    # Platform-aware ping command with a 1-second timeout and no DNS lookup
+                    system = platform.system()
+                    if system == 'Darwin':
+                        cmd = ['ping', '-n', '-c', '1', '-t', '1', ip]
+                    else:  # Linux and other UNIX-like systems
+                        cmd = ['ping', '-n', '-c', '1', '-W', '1', ip]
+
+                    self.logger.debug(f"Pinging {ip} with command: {' '.join(cmd)}")
+                    start_time = time.time()
+                    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                    duration = time.time() - start_time
+                    self.logger.debug(f"Pinged {ip} in {duration:.2f}s. Return code: {result.returncode}")
+
+                    return ip if result.returncode == 0 else None
+                except subprocess.TimeoutExpired:
+                    self.logger.warning(f"Ping to {ip} timed out.")
+                    return None
+                except Exception as e:
+                    self.logger.error(f"Ping to {ip} failed: {e}")
                     return None
             responded: List[str] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
