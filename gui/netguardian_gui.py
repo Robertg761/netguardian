@@ -1055,7 +1055,8 @@ class PacketSnifferTab(QWidget):
         except Exception:
             interfaces = []
         if not interfaces:
-            interfaces = ["en0", "en1", "eth0", "wlan0"]
+            # Include common Windows and Unix interface names as fallbacks
+            interfaces = ["Ethernet", "Wi-Fi", "Ethernet 2", "Local Area Connection", "Wireless Network Connection", "en0", "en1", "eth0", "wlan0"]
         self.interface_combo.addItems(interfaces)
         config_layout.addRow("Interface:", self.interface_combo)
         
