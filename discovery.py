@@ -171,8 +171,17 @@ class HostDiscoverer:
             return results
         except Exception as e:
             msg = str(e)
-            # Fallback path: unprivileged discovery if ARP requires root (macOS BPF /dev/bpf0)
-            if 'Permission denied' in msg or 'cannot open BPF' in msg or '/dev/bpf' in msg:
+            # Fallback path: unprivileged discovery if ARP requires elevated privileges
+            perm_indicators = [
+                'Permission denied',
+                'cannot open BPF',
+                '/dev/bpf',
+                'Operation not permitted',
+                'WinError 5',
+                'Must be root',
+                'need root'
+            ]
+            if any(ind.lower() in msg.lower() for ind in perm_indicators) or isinstance(e, PermissionError):
                 self.logger.warning("ARP requires elevated privileges; falling back to unprivileged ping sweep")
                 return self._discover_hosts_unprivileged(target_range, resolve_hostnames, progress_callback)
             error_msg = f"ARP scan failed: {msg}"
@@ -607,9 +616,17 @@ class HostDiscoverer:
             import concurrent.futures
             def ping(ip: str) -> Optional[str]:
                 try:
-                    # macOS ping uses -c count, -W timeout (in ms)
-                    subprocess.run(['ping', '-c', '1', '-W', '500', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return ip
+                    system = platform.system()
+                    if system == 'Windows':
+                        # Windows ping: -n count, -w timeout(ms)
+                        result = subprocess.run(['ping', '-n', '1', '-w', '500', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        # Unix-like ping: -c count, -W timeout(ms on macOS, seconds on Linux depending on implementation)
+                        # Use a conservative timeout
+                        result = subprocess.run(['ping', '-c', '1', '-W', '1', ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if result.returncode == 0:
+                        return ip
+                    return None
                 except Exception:
                     return None
             responded: List[str] = []
@@ -626,12 +643,24 @@ class HostDiscoverer:
             # Parse ARP cache to get MACs
             mac_map: Dict[str, str] = {}
             try:
-                out = subprocess.check_output(['arp', '-an'], text=True, timeout=5)
-                for line in out.splitlines():
-                    # (? at ) at 1a:2b:... on en0 ifscope [ethernet]
-                    m = re.search(r'\((?P<ip>[^)]+)\) at (?P<mac>([0-9a-f]{2}:){5}[0-9a-f]{2})', line, re.IGNORECASE)
-                    if m:
-                        mac_map[m.group('ip')] = m.group('mac').lower()
+                system = platform.system()
+                if system == 'Windows':
+                    # Windows uses 'arp -a' and MACs are like 00-11-22-33-44-55
+                    out = subprocess.check_output(['arp', '-a'], text=True, timeout=5)
+                    for line in out.splitlines():
+                        line = line.strip()
+                        # Example:  192.168.1.1          00-11-22-33-44-55     dynamic
+                        m = re.match(r'^(?P<ip>(\d{1,3}\.){3}\d{1,3})\s+(?P<mac>[0-9a-fA-F\-]{17})\s+\w+', line)
+                        if m:
+                            mac = m.group('mac').lower().replace('-', ':')
+                            mac_map[m.group('ip')] = mac
+                else:
+                    out = subprocess.check_output(['arp', '-an'], text=True, timeout=5)
+                    for line in out.splitlines():
+                        # (? at ) at 1a:2b:... on en0 ifscope [ethernet]
+                        m = re.search(r'\((?P<ip>[^)]+)\) at (?P<mac>(([0-9a-f]{2}:){5}[0-9a-f]{2}))', line, re.IGNORECASE)
+                        if m:
+                            mac_map[m.group('ip')] = m.group('mac').lower()
             except Exception:
                 pass
             results: List[Dict[str, str]] = []
